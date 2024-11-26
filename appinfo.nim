@@ -13,4 +13,7 @@ type
         nimVersion*: string = NimVersion
 
 proc info*(app: App): string =
-    return app.name & " " & app.version & " (" & app.stage & ") by " & app.author & " (" & app.url & ")"
+    return app.name & " " & app.version & "-" & app.stage & " by " & app.author & " (" & app.url & ")"
+
+proc releaseTag*(app: App): string =
+    return app.name & " " & app.version & "-" & app.stage

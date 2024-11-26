@@ -434,6 +434,10 @@ when isMainModule:
             options[key] = val
         of cmdEnd: discard
     
+    
+    if options.hasKey("releasetag"):
+        echo app.releaseTag
+        quit()
     if options.hasKey("h", "help"):
         usage()
     if options.haskey("arg1"):
