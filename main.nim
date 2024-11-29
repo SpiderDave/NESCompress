@@ -54,6 +54,114 @@ Compress or decompress data from NES games.  Supported formats:
   * Kemko RLE compression (as used in Bugs Bunny Crazy Castle)"""
 )
 
+type
+  Op = object
+    typ: string
+    format: string
+    byte0: HSlice[system.int, system.int] = -1 .. -1
+    byte1: HSlice[system.int, system.int] = -1 .. -1
+    byte2: HSlice[system.int, system.int] = -1 .. -1
+    avoid: bool
+    start: bool
+    size: string
+
+type
+  CompressDef = object
+    name: string
+    shortName: string
+    ops: seq[Op]
+
+let konami = CompressDef(
+    name: "Konami RLE",
+    shortName: "KonamiRLE",
+    ops: @[
+        Op(
+            start: true,
+            typ: "address",
+            byte0: 0..0xff,
+            byte1: 0..0xff,
+            format: "[1]*256+[0]",
+            size: "2",
+        ),
+        Op(
+            typ: "repeat",
+            byte0: 0..0,
+            byte1: 0..0xff,
+            format: "[1] 256",
+            size: "2",
+            avoid: true,
+        ),
+        Op(
+            typ: "repeat",
+            byte0: 1..0x7e,
+            byte1: 0..0xff,
+            format: "[1] [0]",
+            size: "2",
+        ),
+        Op(
+            typ: "repeat",
+            byte0: 0x80..0x80,
+            byte1: 0..0xff,
+            format: "[1] 255",
+            size: "2",
+            avoid: true,
+        ),
+        Op(
+            typ: "address",
+            byte0: 0x7f..0x7f,
+            byte1: 0..0xff,
+            byte2: 0..0xff,
+            format: "[2]*256+[1]",
+            size: "3",
+        ),
+        Op(
+            typ: "copy",
+            byte0: 0x81..0xfe,
+            format: "[0]-128 1",
+            size: "[0]-127",
+        ),
+        Op(
+            typ: "end",
+            byte0: 0xff..0xff,
+            size: "1",
+        )
+    ],
+)
+
+let kemko = CompressDef(
+    name: "Kemko RLE",
+    shortName: "KemkoRLE",
+    ops: @[
+        Op(
+            start: true,
+            typ: "address",
+            format: "0x2000",
+            size: "0",
+        ),
+        Op(
+            typ: "end",
+            byte0: 0xff..0xff,
+            byte1: 0x00..0xff,
+            byte2: 0x00..0x00,
+            size: "3",
+        ),
+        Op(
+            typ: "repeat",
+            byte0: 0xff..0xff,
+            byte1: 0..0xff,
+            byte2: 0..0xff,
+            format: "[1] [2]",
+            size: "3",
+        ),
+        Op(
+            typ: "copy",
+            byte0: 0x00..0xfe,
+            format: "1 0",
+            size: "1",
+        )
+    ],
+)
+
 
 proc toInt(s:string): int =
     if s.startsWith("0x"):
@@ -66,6 +174,32 @@ proc toInt(s:string): int =
         return num
     else:
         return parseInt(s)
+
+proc calc2(s: string): string =
+    if s.find("*") != -1:
+        let lValue = s.split("*", 1)[0].strip
+        let rValue = s.split("*", 1)[1].strip
+        let value = toInt(calc2(lValue)) * toInt(calc2(rValue))
+        return calc2($value)
+    if s.find("/") != -1:
+        let lValue = s.split("/", 1)[0].strip
+        let rValue = s.split("/", 1)[1].strip
+        let value = int(toInt(calc2(lValue)) / toInt(calc2(rValue)))
+        return calc2($value)
+    return s
+
+proc calc(s: string): string =
+    if s.find("+") != -1:
+        let lValue = s.split("+", 1)[0].strip
+        let rValue = s.split("+", 1)[1].strip
+        let value = toInt(calc(lValue)) + toInt(calc(rValue))
+        return calc($value)
+    if s.find("-") != -1:
+        let lValue = s.split("-", 1)[0].strip
+        let rValue = s.split("-", 1)[1].strip
+        let value = toInt(calc(lValue)) - toInt(calc(rValue))
+        return calc($value)
+    return calc2(s)
 
 type
   FilenameExtras = object
@@ -235,111 +369,68 @@ proc compressKonamiRLE(nametable: seq[byte], ppuSection: string): seq[byte] =
     elif ppuSection == "spritePal":
         return compressKonamiRLE(nametable, 0x3f10)
 
-
-# Decompress and extract data from the NES file using Konami RLE format
-proc decompressKonamiRLE(data: seq[byte], offset: int): seq[byte] =
-    var ppu = newSeq[byte](0x4000)  # PPU memory space (16KB)
-    var address = int64(data[offset]) or (int64(data[offset + 1]) shl 8)  # Initial PPU address (little endian)
-    
-    var i = offset + 2  # Start reading data after the address
-    while i < data.len:
-        let op = data[i]
-        inc(i)
-
-        if op == 0:
-            # Read another byte, and write it to the output 256 times
-            let repeatVal = data[i]
-            inc(i)
-            for _ in 0..<256:
-                if address < 0x4000:  # Ensure address is within bounds
-                    ppu[address] = repeatVal
-                    inc(address)
-                else:
-                    echo "Warning: address out of bounds, skipping."
-        elif op >= 1 and op <= 0x7e:
-            # Read another byte, and write it to the output n times
-            let repeatVal = data[i]
-            inc(i)
-            for _ in 0..<int(op):  # Cast op to int to resolve ambiguity
-                if address < 0x4000:
-                    ppu[address] = repeatVal
-                    inc(address)
-                else:
-                    echo "Warning: address out of bounds, skipping."
-        elif op == 0x7f:
-            # Read another two bytes for a new PPU address
-            address = (int64(data[i]) or (int64(data[i+1]) shl 8))  # Corrected with 'shl'
-            i += 2
-        elif op == 0x80:
-            # Read another byte, and write it to the output 255 times
-            let repeatVal = data[i]
-            inc(i)
-            for _ in 0..<255:
-                if address < 0x4000:
-                    ppu[address] = repeatVal
-                    inc(address)
-                else:
-                    echo "Warning: address out of bounds, skipping."
-        elif op >= 0x81 and op <= 0xfe:
-            # Copy n - 128 bytes from input to output
-            let count = int(op) - 128
-            for j in 0..<count:
-                if address < 0x4000:
-                    ppu[address] = data[i + j]
-                    inc(address)
-                else:
-                    echo "Warning: address out of bounds, skipping."
-            i += count
-        elif op == 0xff:
-            break  # End of data
-
-    result = ppu
-
-proc decompressKemkoRLE(data: seq[byte], offset: int): seq[byte] =
+proc decompress(compression: CompressDef, data: seq[byte], offset: int): seq[byte] =
     var ppu = newSeq[byte](0x4000)  # PPU memory space (16KB)
     var address = 0x2000
     
     var i = offset
-    
+    var start = true
     while i < data.len:
-        let op = data[i]
-        # don't increment i yet because this might be data (not op)
-
-        if op == 0xff:
-            i += 1
-            # Read two bytes for (value, len) and write value to output len times
-            let repeatVal = data[i]
-            i += 1
-            let l = data[i]
-            i += 1
-            
-            # Writing 0 times signals end of data
-            if l == 0:
-                break
-            
-            for _ in 0..l.int-1:
-                if address < 0x4000:  # Ensure address is within bounds
-                    ppu[address] = repeatVal
-                    address += 1
-                else:
-                    echo fmt"Warning: address 0x{address:04x} out of bounds, skipping."
-        else: # 0x00 - 0xfe
-            # Copy bytes from input to output
-            
-            # copy until we find another 0xff
-            
-            while true:
-                if data[i] == 0xff:
+        let b0 = data[i+0].int
+        let b1 = data[i+1].int
+        let b2 = data[i+2].int
+        echo $b0, " ", $b1, " ", $b2
+        
+        var validOp = false
+        for op in compression.ops:
+            if (op.start == false or start == true) and ((b0 in op.byte0 or -1 in op.byte0) and (b1 in op.byte1 or -1 in op.byte1) and (b2 in op.byte2 or -1 in op.byte2)):
+                start = false
+                validOp = true
+                if (op.start == true and i == offset):
+#                    echo "start"
+                var fmt = op.format
+                fmt = fmt.replace("[0]", $b0)
+                fmt = fmt.replace("[1]", $b1)
+                fmt = fmt.replace("[2]", $b2)
+                
+                var fmtSize = op.size
+                fmtSize = fmtSize.replace("[0]", $b0)
+                fmtSize = fmtSize.replace("[1]", $b1)
+                fmtSize = fmtSize.replace("[2]", $b2)
+                
+                let size = toInt(calc(fmtSize))
+                
+                if op.typ == "repeat":
+                    let v1 = calc(fmt.split()[0])
+                    let v2 = calc(fmt.split()[1])
+#                    echo op.typ & " " & v1 & " " & v2
+                    for _ in 0..<toInt(v2):
+                        ppu[address] = toInt(v1).uint8
+                        address = address + 1
+                    i = i + size
                     break
-                
-                if address < 0x4000:
-                    ppu[address] = data[i]
-                    address += 1
-                else:
-                    echo fmt"Warning: address 0x{address:04x} out of bounds, skipping."
-                
-                i += 1
-
+                if op.typ == "address":
+                    let a = calc(fmt)
+#                    echo op.typ & " " & a
+                    address = toInt(a)
+                    i = i + size
+                    break
+                if op.typ == "copy":
+                    let count = toInt(calc(fmt.split()[0]))
+                    let copyStartOffset = toInt(calc(fmt.split()[1]))
+#                    echo op.typ & " " & $count
+                    for j in 0..<count:
+                        ppu[address] = data[i + j + copyStartOffset]
+                        address = address + 1
+                    i = i + size
+                    break
+                if op.typ == "end":
+#                    echo op.typ
+                    i = i + size
+                    return ppu
+        if not validOp:
+            echo "invalid op"
+            return ppu
     result = ppu
 
 # Helper functions to extract specific parts of the PPU memory
@@ -406,6 +497,39 @@ proc usage() =
 
 # Run the main procedure only when it's the main module
 when isMainModule:
+    
+    
+#    let b0 = 0x02
+#    let b1 = 0x20
+#    let b2 = 0x01
+#    let start = true
+    
+#    for op in konami.ops:
+#        if start == true or ((b0 in op.byte0 or -1 in op.byte0) and (b1 in op.byte1 or -1 in op.byte1) and (b2 in op.byte2 or -1 in op.byte2)):
+#            var fmt = op.format
+#            fmt = fmt.replace("[0]", $b0)
+#            fmt = fmt.replace("[1]", $b1)
+#            fmt = fmt.replace("[2]", $b2)
+#            if op.typ == "repeat":
+#                let v1 = calc(fmt.split()[0])
+#                let v2 = calc(fmt.split()[1])
+#                echo op.typ & " " & v1 & " " & v2
+#                break
+#            if op.typ == "address":
+#                let a = calc(fmt)
+#                echo op.typ & " " & a
+#                break
+#            if op.typ == "copy":
+#                let n = calc(fmt)
+#                echo op.typ & " " & n
+#                break
+#            if op.typ == "end":
+#                echo op.typ
+#                break
+            
+            
+#    quit()
+    
     proc hasKey(t: Table[string, string]; key1, key2: string): bool =
         if t.hasKey(key1):
             return true
@@ -456,8 +580,8 @@ when isMainModule:
         usage()
     
     var mode = "konami"
-    if options.hasKey("m", "mode"):
-        mode = options.getVal("m", "mode")
+    if options.hasKey("m", "method"):
+        mode = options.getVal("m", "method")
     
     if options.haskey("decompress", "d"):
         let inputFile = parseFilename(options.getVal("decompress", "d"))
@@ -467,12 +591,12 @@ when isMainModule:
         
         var ppu = newSeq[byte](0x4000)
         
-        if mode == "kemko":
-            ppu = decompressKemkoRLE(data, inputFile.offset)
-        elif mode == "konami":
-            ppu = decompressKonamiRLE(data, inputFile.offset)
+        if mode == "konami":
+            ppu = decompress(konami, data, inputFile.offset)
+        elif mode == "kemko":
+            ppu = decompress(kemko, data, inputFile.offset)
         else:
-            echo "unknown decompress mode"
+            echo "unknown decompress method"
 
         # file will not be written if the value is ""
         write(parseFilename(options.getVal("nt0", "0")), ppu.nt0)
@@ -501,7 +625,7 @@ when isMainModule:
         elif mode == "konami":
             compressed = compressKonamiRLE(data, ppuAddress)
         else:
-            echo "unknown compress mode"
+            echo "unknown compress method"
         
         echo fmt"  Compressed size: {compressed.len} bytes"
         echo fmt"  Target PPU Address: 0x{ppuAddress:04x}"

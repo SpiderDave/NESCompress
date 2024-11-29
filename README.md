@@ -1,5 +1,5 @@
 ```
-NESCompress v2024.11.26 (alpha) by SpiderDave (https://github.com/spiderdave)
+NESCompress v2024.11.26-alpha by SpiderDave (https://github.com/spiderdave)
 
 Compress or decompress data from NES games.  Supported formats:
   * Konami RLE compression (as used in Life Force)
