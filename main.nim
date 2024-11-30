@@ -1,39 +1,4 @@
-# -------------------------------------------------------------------------------------
-# Konami RLE compression (as used in Life Force)
-#
-# Start with a 2 byte PPU address (little endian), then zero or more operations:
-#
-# 00        Read another byte, and write it to the output 256 times
-# 01-7E     Read another byte, and write it to the output n times.
-# 7F        Read another two bytes for a new PPU address
-# 80        Read another byte, and write it to the output 255 times
-# 81-FE     Copy n - 128 bytes from input to output.
-# FF        End of data
-#
-# Notes:
-#           00 is never used.  Sometimes listed as copy 0 bytes.  Avoiding.
-#           80 can be inconsistant/invalid/error on some games.  Avoiding.
-#
-# References:
-#           https://datacrystal.romhacking.net/wiki/Blades_of_Steel:ROM_map
-#           https://www.nesdev.org/wiki/Tile_compression#Konami_RLE
-# -------------------------------------------------------------------------------------
-
-# Kemko RLE compression (as used in Bugs Bunny Crazy Castle)
-#
-# Uses a rudimentary RLE compression.
-#
-# FF xx yy  Output tile xx yy times.
-# 00-FE     Copy input to output.
-# FF FF 00  End of data.  The second byte can be anything, but FF is used.
-#-------------------------------------------------------------------------------------
-#
-# Select Screen data:
-# 03:d7d6 (file offset 0xd7e6)
-# 0x33d bytes
-
 import
-    os,
     resource/resource,
     parseopt,
     parseutils,
@@ -64,6 +29,8 @@ type
     avoid: bool
     start: bool
     size: string
+    noBreak: bool
+    addressAdd: string = "1"
 
 type
   CompressDef = object
@@ -71,97 +38,16 @@ type
     shortName: string
     ops: seq[Op]
 
-let konami = CompressDef(
-    name: "Konami RLE",
-    shortName: "KonamiRLE",
-    ops: @[
-        Op(
-            start: true,
-            typ: "address",
-            byte0: 0..0xff,
-            byte1: 0..0xff,
-            format: "[1]*256+[0]",
-            size: "2",
-        ),
-        Op(
-            typ: "repeat",
-            byte0: 0..0,
-            byte1: 0..0xff,
-            format: "[1] 256",
-            size: "2",
-            avoid: true,
-        ),
-        Op(
-            typ: "repeat",
-            byte0: 1..0x7e,
-            byte1: 0..0xff,
-            format: "[1] [0]",
-            size: "2",
-        ),
-        Op(
-            typ: "repeat",
-            byte0: 0x80..0x80,
-            byte1: 0..0xff,
-            format: "[1] 255",
-            size: "2",
-            avoid: true,
-        ),
-        Op(
-            typ: "address",
-            byte0: 0x7f..0x7f,
-            byte1: 0..0xff,
-            byte2: 0..0xff,
-            format: "[2]*256+[1]",
-            size: "3",
-        ),
-        Op(
-            typ: "copy",
-            byte0: 0x81..0xfe,
-            format: "[0]-128 1",
-            size: "[0]-127",
-        ),
-        Op(
-            typ: "end",
-            byte0: 0xff..0xff,
-            size: "1",
-        )
-    ],
-)
+var formats: seq[CompressDef]
+include formats
 
-let kemko = CompressDef(
-    name: "Kemko RLE",
-    shortName: "KemkoRLE",
-    ops: @[
-        Op(
-            start: true,
-            typ: "address",
-            format: "0x2000",
-            size: "0",
-        ),
-        Op(
-            typ: "end",
-            byte0: 0xff..0xff,
-            byte1: 0x00..0xff,
-            byte2: 0x00..0x00,
-            size: "3",
-        ),
-        Op(
-            typ: "repeat",
-            byte0: 0xff..0xff,
-            byte1: 0..0xff,
-            byte2: 0..0xff,
-            format: "[1] [2]",
-            size: "3",
-        ),
-        Op(
-            typ: "copy",
-            byte0: 0x00..0xfe,
-            format: "1 0",
-            size: "1",
-        )
-    ],
-)
+proc getMethod(formats: seq[CompressDef], name: string): CompressDef =
+    for format in formats:
+        if format.shortName.toLowerAscii == name.toLowerAscii:
+            return format
 
+    echo fmt"""Error: Compression method "{name}" not found"""
+    quit()
 
 proc toInt(s:string): int =
     if s.startsWith("0x"):
@@ -244,12 +130,12 @@ proc write(file: FilenameExtras, data: seq[byte]) =
         echo "File modified: ", file.name
 
 
-proc write(filename: string, data: seq[byte]) =
-    if filename == "":
-        return
-    else:
-        writeFile(filename, data)
-        echo "File created: ", filename
+#proc write(filename: string, data: seq[byte]) =
+#    if filename == "":
+#        return
+#    else:
+#        writeFile(filename, data)
+#        echo "File created: ", filename
 
 # Helper function to determine how many times the first byte in the sequence repeats
 proc getRep(data: seq[byte], startIdx: int): int =
@@ -258,12 +144,16 @@ proc getRep(data: seq[byte], startIdx: int): int =
         rep += 1
     return rep
 
+proc fillVars(fmtString: string, data: seq[byte], offset:int = 0): string =
+    var s = fmtString
+    for i in 0..10:
+        if offset + i > data.len-1:
+            break
+        s = s.replace(fmt"[{i}]", $data[offset + i].int)
+    return s
+
 proc compressKemkoRLE(nametable: seq[byte], ppuAddress: int): seq[byte] =
     var compressedData = newSeq[byte]()
-    
-    # Add initial PPU address
-#    compressedData.add(byte(ppuAddress mod 0x100))  # PPU address low byte
-#    compressedData.add(byte(ppuAddress / 0x100))  # PPU address high byte
 
     var i = 0
     let length = nametable.len
@@ -306,7 +196,7 @@ proc compressKemkoRLE(nametable: seq[byte], ppuAddress: int): seq[byte] =
     
     return compressedData
 
-proc compressKonamiRLE(nametable: seq[byte], ppuAddress: int): seq[byte] =
+proc compressKonamiRLE(data: seq[byte], ppuAddress: int): seq[byte] =
     var compressedData = newSeq[byte]()
     
     # Add initial PPU address
@@ -314,11 +204,11 @@ proc compressKonamiRLE(nametable: seq[byte], ppuAddress: int): seq[byte] =
     compressedData.add(byte(ppuAddress / 0x100))  # PPU address high byte
 
     var i = 0
-    let length = nametable.len
+    let length = data.len
 
     while i < length:
-        let currentByte = nametable[i]
-        var rep = getRep(nametable, i)  # Get how many times the current byte repeats
+        let currentByte = data[i]
+        var rep = getRep(data, i)  # Get how many times the current byte repeats
         
         if rep > 0x7e:
             # If repetition is greater than 0x7e, we cap it at 0x7e
@@ -333,9 +223,9 @@ proc compressKonamiRLE(nametable: seq[byte], ppuAddress: int): seq[byte] =
         else:
             # Otherwise, perform the copy operation
             var copyData = newSeq[byte]()
-            while i < length and getRep(nametable, i) < 4 and copyData.len < 0x7e:
-                copyData.add(nametable[i])
-                inc(i)
+            while i < length and getRep(data, i) < 4 and copyData.len < 0x7e:
+                copyData.add(data[i])
+                i = i + 1
                 
             compressedData.add(byte(0x80 + copyData.len))  # Operation byte (0x80 + n)
             compressedData.add(copyData)  # Add the copied data to the compressed output
@@ -343,91 +233,111 @@ proc compressKonamiRLE(nametable: seq[byte], ppuAddress: int): seq[byte] =
     compressedData.add(0xff)  # End of data marker
     return compressedData
 
-proc compressKonamiRLE(nametable: seq[byte], ppuSection: string): seq[byte] =
-    if ppuSection == "nt0":
-        return compressKonamiRLE(nametable, 0x2000)
-    elif ppuSection == "nt1":
-        return compressKonamiRLE(nametable, 0x2400)
-    elif ppuSection == "nt2":
-        return compressKonamiRLE(nametable, 0x2800)
-    elif ppuSection == "nt3":
-        return compressKonamiRLE(nametable, 0x2c00)
-    elif ppuSection == "att0":
-        return compressKonamiRLE(nametable, 0x23c0)
-    elif ppuSection == "att1":
-        return compressKonamiRLE(nametable, 0x27c0)
-    elif ppuSection == "att2":
-        return compressKonamiRLE(nametable, 0x2bc0)
-    elif ppuSection == "att3":
-        return compressKonamiRLE(nametable, 0x2fc0)
-    elif ppuSection == "chr0":
-        return compressKonamiRLE(nametable, 0x0000)
-    elif ppuSection == "chr1":
-        return compressKonamiRLE(nametable, 0x1000)
-    elif ppuSection == "bgPal":
-        return compressKonamiRLE(nametable, 0x3f00)
-    elif ppuSection == "spritePal":
-        return compressKonamiRLE(nametable, 0x3f10)
+#proc compressKonamiRLE(data: seq[byte], ppuSection: string): seq[byte] =
+#    if ppuSection == "nt0":
+#        return compressKonamiRLE(data, 0x2000)
+#    elif ppuSection == "nt1":
+#        return compressKonamiRLE(data, 0x2400)
+#    elif ppuSection == "nt2":
+#        return compressKonamiRLE(data, 0x2800)
+#    elif ppuSection == "nt3":
+#        return compressKonamiRLE(data, 0x2c00)
+#    elif ppuSection == "att0":
+#        return compressKonamiRLE(data, 0x23c0)
+#    elif ppuSection == "att1":
+#        return compressKonamiRLE(data, 0x27c0)
+#    elif ppuSection == "att2":
+#        return compressKonamiRLE(data, 0x2bc0)
+#    elif ppuSection == "att3":
+#        return compressKonamiRLE(data, 0x2fc0)
+#    elif ppuSection == "chr0":
+#        return compressKonamiRLE(data, 0x0000)
+#    elif ppuSection == "chr1":
+#        return compressKonamiRLE(data, 0x1000)
+#    elif ppuSection == "bgPal":
+#        return compressKonamiRLE(data, 0x3f00)
+#    elif ppuSection == "spritePal":
+#        return compressKonamiRLE(data, 0x3f10)
 
-proc decompress(compression: CompressDef, data: seq[byte], offset: int): seq[byte] =
+proc print(log: var string, s: string) =
+#    echo s
+    log &= s & "\n"
+
+proc decompress(compression: CompressDef, data: seq[byte], offset: int, fillTile:byte = 0x00): seq[byte] =
     var ppu = newSeq[byte](0x4000)  # PPU memory space (16KB)
     var address = 0x2000
     
+    var log = ""
+    
+    for i in 0x2000..0x23bf:
+        ppu[i] = fillTile.uint8
+    for i in 0x2400..0x27bf:
+        ppu[i] = fillTile.uint8
+    for i in 0x2800..0x2bbf:
+        ppu[i] = fillTile.uint8
+    for i in 0x2c00..0x2fbf:
+        ppu[i] = fillTile.uint8
+    
     var i = offset
     var start = true
+    var done = false
     while i < data.len:
-        let b0 = data[i+0].int
-        let b1 = data[i+1].int
-        let b2 = data[i+2].int
-        echo $b0, " ", $b1, " ", $b2
-        
         var validOp = false
         for op in compression.ops:
+            var b0, b1, b2:int = -2     # invalid value for end of file
+            b0 = data[i+0].int
+            if i+1 < data.len:
+                b1 = data[i+1].int
+            if i+2 < data.len:
+                b2 = data[i+2].int
+
             if (op.start == false or start == true) and ((b0 in op.byte0 or -1 in op.byte0) and (b1 in op.byte1 or -1 in op.byte1) and (b2 in op.byte2 or -1 in op.byte2)):
                 start = false
                 validOp = true
                 if (op.start == true and i == offset):
-#                    echo "start"
-                var fmt = op.format
-                fmt = fmt.replace("[0]", $b0)
-                fmt = fmt.replace("[1]", $b1)
-                fmt = fmt.replace("[2]", $b2)
+                    log.print "start"
                 
-                var fmtSize = op.size
-                fmtSize = fmtSize.replace("[0]", $b0)
-                fmtSize = fmtSize.replace("[1]", $b1)
-                fmtSize = fmtSize.replace("[2]", $b2)
-                
-                let size = toInt(calc(fmtSize))
+                let fmtOp = op.format.fillVars(data, i)
+                let size = toInt(calc(op.size.fillVars(data, i)))
+                let addressAdd = toInt(calc(op.addressAdd.fillVars(data, i)))
                 
                 if op.typ == "repeat":
-                    let v1 = calc(fmt.split()[0])
-                    let v2 = calc(fmt.split()[1])
-#                    echo op.typ & " " & v1 & " " & v2
-                    for _ in 0..<toInt(v2):
-                        ppu[address] = toInt(v1).uint8
-                        address = address + 1
+                    let v1 = toInt(calc(fmtOp.split()[0]))
+                    let v2 = toInt(calc(fmtOp.split()[1]))
+                    
+                    log.print fmt"{op.typ} {v1:02x} {v2:02x}"
+                    for _ in 0..<v2:
+                        ppu[address] = v1.uint8
+                        address = address + addressAdd
                     i = i + size
                     break
                 if op.typ == "address":
-                    let a = calc(fmt)
-#                    echo op.typ & " " & a
-                    address = toInt(a)
+                    let a = toInt(calc(fmtOp))
+                    log.print fmt"{op.typ} {a:04x}"
+                    address = a
                     i = i + size
-                    break
+                    if not op.noBreak:
+                        break
                 if op.typ == "copy":
-                    let count = toInt(calc(fmt.split()[0]))
-                    let copyStartOffset = toInt(calc(fmt.split()[1]))
-#                    echo op.typ & " " & $count
+                    let count = toInt(calc(fmtOp.split()[0]))
+                    let copyStartOffset = toInt(calc(fmtOp.split()[1]))
+                    log.print fmt"{op.typ} {count:02x}"
                     for j in 0..<count:
+                        if i + j + copyStartOffset > data.len - 1:
+                            done = true
+                            break
                         ppu[address] = data[i + j + copyStartOffset]
-                        address = address + 1
+                        address = address + addressAdd
                     i = i + size
                     break
                 if op.typ == "end":
-#                    echo op.typ
+                    log.print fmt"{op.typ}"
                     i = i + size
-                    return ppu
+                    done = true
+                    break
+        if done:
+#            echo log
+            break
         if not validOp:
             echo "invalid op"
             return ppu
@@ -477,13 +387,15 @@ proc usage() =
     echo "  -3, --nt3:filename              output filename for nametable 3 (d)"
     echo "  -b, --bkpal:filename            output filename for background palette (d)"
     echo "  -s, --spritepal:filename        output filename for sprite palette (d)"
+    echo "  -f, --fill:tile                 initial tile to fill nametables with (d)"
     echo "  -h, --help                      Show this help"
     echo "  -v, --version                   show detailed version information"
     echo ""
     echo "Items labeled with (d) apply only to decompressing."
     echo "Items labeled with (c) apply only to compressing."
     echo ""
-    echo "Valid compression methods are: [konami, kemko]"
+    echo "Valid compression methods are:"
+    echo "  [konami, konami2, kemko, stripe (d), packbits (d), ppudump (d)]"
     echo ""
     echo "When specifying filenames, you may also use a colon at the end and add"
     echo "a file offset."
@@ -497,38 +409,6 @@ proc usage() =
 
 # Run the main procedure only when it's the main module
 when isMainModule:
-    
-    
-#    let b0 = 0x02
-#    let b1 = 0x20
-#    let b2 = 0x01
-#    let start = true
-    
-#    for op in konami.ops:
-#        if start == true or ((b0 in op.byte0 or -1 in op.byte0) and (b1 in op.byte1 or -1 in op.byte1) and (b2 in op.byte2 or -1 in op.byte2)):
-#            var fmt = op.format
-#            fmt = fmt.replace("[0]", $b0)
-#            fmt = fmt.replace("[1]", $b1)
-#            fmt = fmt.replace("[2]", $b2)
-#            if op.typ == "repeat":
-#                let v1 = calc(fmt.split()[0])
-#                let v2 = calc(fmt.split()[1])
-#                echo op.typ & " " & v1 & " " & v2
-#                break
-#            if op.typ == "address":
-#                let a = calc(fmt)
-#                echo op.typ & " " & a
-#                break
-#            if op.typ == "copy":
-#                let n = calc(fmt)
-#                echo op.typ & " " & n
-#                break
-#            if op.typ == "end":
-#                echo op.typ
-#                break
-            
-            
-#    quit()
     
     proc hasKey(t: Table[string, string]; key1, key2: string): bool =
         if t.hasKey(key1):
@@ -558,7 +438,6 @@ when isMainModule:
             options[key] = val
         of cmdEnd: discard
     
-    
     if options.hasKey("releasetag"):
         echo app.releaseTag
         quit()
@@ -579,7 +458,7 @@ when isMainModule:
         # did not specify compress or decompress
         usage()
     
-    var mode = "konami"
+    var mode = "konami2"
     if options.hasKey("m", "method"):
         mode = options.getVal("m", "method")
     
@@ -591,12 +470,11 @@ when isMainModule:
         
         var ppu = newSeq[byte](0x4000)
         
-        if mode == "konami":
-            ppu = decompress(konami, data, inputFile.offset)
-        elif mode == "kemko":
-            ppu = decompress(kemko, data, inputFile.offset)
-        else:
-            echo "unknown decompress method"
+        var fillTile:byte = 0x00
+        if options.haskey("fill", "f"):
+            fillTile = toInt(options.getVal("fill", "f")).byte
+        
+        ppu = decompress(formats.getMethod(mode), data, inputFile.offset, fillTile)
 
         # file will not be written if the value is ""
         write(parseFilename(options.getVal("nt0", "0")), ppu.nt0)
@@ -605,6 +483,7 @@ when isMainModule:
         write(parseFilename(options.getVal("nt3", "3")), ppu.nt3)
         write(parseFilename(options.getVal("bkpal", "b")), ppu.palBk)
         write(parseFilename(options.getVal("spritepal", "s")), ppu.palSprite)
+        write(parseFilename(options.getVal("outputfile", "o")), ppu)
     elif options.haskey("compress", "c"):
         let inputFile = parseFilename(options.getVal("compress", "c"))
         

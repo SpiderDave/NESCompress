@@ -1,5 +1,5 @@
 ```
-NESCompress v2024.11.26-alpha by SpiderDave (https://github.com/spiderdave)
+NESCompress v2024.11.30-alpha by SpiderDave (https://github.com/spiderdave)
 
 Compress or decompress data from NES games.  Supported formats:
   * Konami RLE compression (as used in Life Force)
@@ -19,13 +19,15 @@ Options:
   -3, --nt3:filename              output filename for nametable 3 (d)
   -b, --bkpal:filename            output filename for background palette (d)
   -s, --spritepal:filename        output filename for sprite palette (d)
+  -f, --fill:tile                 initial tile to fill nametables with (d)
   -h, --help                      Show this help
   -v, --version                   show detailed version information
 
 Items labeled with (d) apply only to decompressing.
 Items labeled with (c) apply only to compressing.
 
-Valid compression methods are: [konami, kemko]
+Valid compression methods are:
+  [konami, konami2, kemko, stripe (d), packbits (d), ppudump (d)]
 
 When specifying filenames, you may also use a colon at the end and add
 a file offset.
