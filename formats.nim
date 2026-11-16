@@ -273,3 +273,70 @@ formats.add(CompressDef(
         ),
     ],
 ))
+
+# -------------------------------------------------------------------------------------
+# Modified RLE compression (as used in Downtown Nekketsu Monogatari)
+#
+# 00        Read the next two bytes as a PPU address (big endian).
+#           If both bytes are 00, end of data.
+# 01-3F     Read another byte, and write it to the output n times.
+# 40-7F     Copy n - 0x40 bytes from input to output.
+# 80-FF     Unknown.
+# -------------------------------------------------------------------------------------
+formats.add(CompressDef(
+    name: "Modified RLE (Downtown Nekketsu Monogatari)",
+    shortName: "downtown",
+    ops: @[
+        Op(
+            typ: "end",
+            byte0: 0x00..0x00,
+            byte1: 0x00..0x00,
+            size: "2",
+        ),
+        Op(
+            typ: "address",
+            byte0: 0x00..0x00,
+            byte1: 0x01..0xff,
+            byte2: 0x00..0xff,
+            format: "[1]*256+[2]",
+            size: "3",
+        ),
+        Op(
+            typ: "repeat",
+            byte0: 0x01..0x3f,
+            byte1: 0x00..0xff,
+            format: "[1] [0]",
+            size: "2",
+        ),
+        Op(
+            typ: "copy",
+            byte0: 0x40..0x7f,
+            format: "[0]-0x40 1",
+            size: "[0]-0x3f",
+        ),
+    ],
+))
+
+
+# No compression
+formats.add(CompressDef(
+    name: "None",
+    shortName: "none",
+    ops: @[
+        Op(
+            start: true,
+            typ: "address",
+            format: "0",
+            size: "0",
+        ),
+        Op(
+            typ: "copy",
+            byte0: 0x00..0xff,
+            format: "1 0",
+            size: "1",
+        ),
+        Op(
+            typ: "end",
+        )
+    ],
+))

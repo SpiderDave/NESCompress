@@ -2,11 +2,15 @@ import
     resource/resource,
     parseopt,
     parseutils,
-    strutils,
-    strformat,
-    tables
+    std/strutils,
+    std/sequtils,
+    std/strformat,
+    tables,
+    std/os
 
 import appinfo
+
+import nss
 
 const app: App = App(
     name: "NESCompress",
@@ -14,9 +18,8 @@ const app: App = App(
     author: "SpiderDave",
     stage: "alpha",
     description: """
-Compress or decompress data from NES games.  Supported formats:
-  * Konami RLE compression (as used in Life Force)
-  * Kemko RLE compression (as used in Bugs Bunny Crazy Castle)"""
+Compress or decompress data from NES games.
+""".strip
 )
 
 type
@@ -125,17 +128,11 @@ proc write(file: FilenameExtras, data: seq[byte]) =
         for i in 0..data.len-1:
             if file.length != 0 and i > file.length:
                 break
+            if file.length != 0 and file.offset + i > file.length:
+                break
             data2[file.offset + i] = data[i]
         writeFile(file.name, data2)
         echo "File modified: ", file.name
-
-
-#proc write(filename: string, data: seq[byte]) =
-#    if filename == "":
-#        return
-#    else:
-#        writeFile(filename, data)
-#        echo "File created: ", filename
 
 # Helper function to determine how many times the first byte in the sequence repeats
 proc getRep(data: seq[byte], startIdx: int): int =
@@ -151,6 +148,226 @@ proc fillVars(fmtString: string, data: seq[byte], offset:int = 0): string =
             break
         s = s.replace(fmt"[{i}]", $data[offset + i].int)
     return s
+
+# Get the valid byte range for an operation.
+# An unspecified range (-1..-1) accepts any byte.
+proc getBounds(r: HSlice[int, int]): tuple[first, last: int] =
+    if r.a == -1 and r.b == -1:
+        return (0, 0xff)
+    return (r.a, r.b)
+
+proc getOpSize(op: Op, command: seq[byte]): int =
+    if op.size == "":
+        return 0
+    return toInt(calc(op.size.fillVars(command)))
+
+# Create an address command matching the requested PPU address.
+proc makeAddressCommand(op: Op, ppuAddress: int): seq[byte] =
+    let size = toInt(calc(op.size))
+    if size == 0:
+        return
+
+    if size > 3:
+        return
+
+    let b0 = getBounds(op.byte0)
+    let b1 = getBounds(op.byte1)
+    let b2 = getBounds(op.byte2)
+
+    let last2 = if size >= 3: b2.last else: 0
+    let first2 = if size >= 3: b2.first else: 0
+
+    for v0 in b0.first..b0.last:
+        for v1 in b1.first..b1.last:
+            for v2 in first2..last2:
+                let command = @[byte(v0), byte(v1), byte(v2)]
+                let value = toInt(calc(op.format.fillVars(command)))
+
+                if value == ppuAddress:
+                    for j in 0..<size:
+                        result.add(command[j])
+                    return
+
+# Create an end command using the lowest valid byte values.
+proc makeEndCommand(op: Op): seq[byte] =
+    if op.size == "":
+        return
+
+    let size = toInt(calc(op.size))
+    if size <= 0 or size > 3:
+        return
+
+    let b0 = getBounds(op.byte0)
+    let b1 = getBounds(op.byte1)
+    let b2 = getBounds(op.byte2)
+
+    let values = [b0.first, b1.first, b2.first]
+
+    for j in 0..<size:
+        result.add(byte(values[j]))
+
+proc compress(compression: CompressDef, data: seq[byte], ppuAddress: int): seq[byte] =
+    if data.len == 0:
+        return
+
+    if compression.shortName == "none":
+        return data
+
+    # Emit the initial address command, if the format has one.
+    var hasStartAddress = false
+
+    for op in compression.ops:
+        if op.typ == "address":
+            if op.start:
+                hasStartAddress = true
+
+            let command = makeAddressCommand(op, ppuAddress)
+
+            if command.len > 0:
+                result.add(command)
+                hasStartAddress = true
+                break
+
+    # Handle formats with a constant start address.
+    if not hasStartAddress:
+        for op in compression.ops:
+            if op.start and op.typ == "address" and op.size == "0":
+                break
+
+    var i = 0
+
+    while i < data.len:
+        # Determine the length of the current repeated sequence.
+        var runLength = 1
+
+        while i + runLength < data.len and data[i + runLength] == data[i]:
+            runLength += 1
+
+        var bestCommand: seq[byte]
+        var bestCount = 0
+        var bestSaving = -999
+
+        # Find the best repeat or copy operation.
+        for op in compression.ops:
+            if op.avoid:
+                continue
+
+            if op.start or op.typ == "address" or op.typ == "end":
+                continue
+
+            if op.typ == "repeat":
+                let b0 = getBounds(op.byte0)
+                let b1 = getBounds(op.byte1)
+                let b2 = getBounds(op.byte2)
+
+                let useB1 = op.format.contains("[1]")
+                let useB2 = op.format.contains("[2]")
+
+                for v0 in b0.first..b0.last:
+                    let first1 = if useB1: b1.first else: 0
+                    let last1 = if useB1: b1.last else: 0
+                    let first2 = if useB2: b2.first else: 0
+                    let last2 = if useB2: b2.last else: 0
+
+                    for v1 in first1..last1:
+                        for v2 in first2..last2:
+                            let command = @[byte(v0), byte(v1), byte(v2)]
+                            let fmtOp = op.format.fillVars(command)
+                            let values = fmtOp.splitWhitespace()
+
+                            if values.len < 2:
+                                continue
+
+                            let value = toInt(calc(values[0]))
+                            let count = toInt(calc(values[1]))
+                            let size = getOpSize(op, command)
+
+                            if value != data[i].int:
+                                continue
+
+                            if count <= 0 or count > runLength:
+                                continue
+
+                            if size <= 0 or size > 3:
+                                continue
+
+                            let saving = count - size
+
+                            if saving > bestSaving or
+                                (saving == bestSaving and count > bestCount):
+
+                                bestCommand = command[0..<size]
+                                bestCount = count
+                                bestSaving = saving
+
+            elif op.typ == "copy":
+                let b0 = getBounds(op.byte0)
+
+                for v0 in b0.first..b0.last:
+                    var command = @[byte(v0), byte(0), byte(0)]
+
+                    let fmtOp = op.format.fillVars(command)
+                    let values = fmtOp.splitWhitespace()
+
+                    if values.len < 2:
+                        continue
+
+                    let count = toInt(calc(values[0]))
+                    let copyStartOffset = toInt(calc(values[1]))
+                    let size = getOpSize(op, command)
+
+                    if count <= 0 or count > data.len - i:
+                        continue
+
+                    if copyStartOffset < 0 or size <= 0:
+                        continue
+
+                    if size > 0x10000 or copyStartOffset + count > size:
+                        continue
+
+                    # When copying from offset zero, the opcode itself
+                    # must be the first literal byte.
+                    if copyStartOffset == 0 and data[i].int != v0:
+                        continue
+
+                    command = newSeq[byte](size)
+                    command[0] = byte(v0)
+
+                    # Populate any additional control bytes.
+                    if copyStartOffset > 1 and size > 1:
+                        let b1 = getBounds(op.byte1)
+                        command[1] = byte(b1.first)
+
+                    if copyStartOffset > 2 and size > 2:
+                        let b2 = getBounds(op.byte2)
+                        command[2] = byte(b2.first)
+
+                    # Insert the literal data.
+                    for j in 0..<count:
+                        command[copyStartOffset + j] = data[i + j]
+
+                    let saving = count - size
+
+                    if saving > bestSaving or
+                        (saving == bestSaving and count > bestCount):
+
+                        bestCommand = command
+                        bestCount = count
+                        bestSaving = saving
+
+        # Write the selected operation.
+        if bestCommand.len == 0 or bestCount == 0:
+            raise newException(ValueError,
+                fmt"Unable to compress data at offset 0x{i:x} using {compression.shortName}")
+
+        result.add(bestCommand)
+        i += bestCount
+
+    # Append the format's end command, if one exists.
+    for op in compression.ops:
+        if op.typ == "end":
+            result.add(makeEndCommand(op))
+            break
 
 proc compressKemkoRLE(nametable: seq[byte], ppuAddress: int): seq[byte] =
     var compressedData = newSeq[byte]()
@@ -232,32 +449,6 @@ proc compressKonamiRLE(data: seq[byte], ppuAddress: int): seq[byte] =
 
     compressedData.add(0xff)  # End of data marker
     return compressedData
-
-#proc compressKonamiRLE(data: seq[byte], ppuSection: string): seq[byte] =
-#    if ppuSection == "nt0":
-#        return compressKonamiRLE(data, 0x2000)
-#    elif ppuSection == "nt1":
-#        return compressKonamiRLE(data, 0x2400)
-#    elif ppuSection == "nt2":
-#        return compressKonamiRLE(data, 0x2800)
-#    elif ppuSection == "nt3":
-#        return compressKonamiRLE(data, 0x2c00)
-#    elif ppuSection == "att0":
-#        return compressKonamiRLE(data, 0x23c0)
-#    elif ppuSection == "att1":
-#        return compressKonamiRLE(data, 0x27c0)
-#    elif ppuSection == "att2":
-#        return compressKonamiRLE(data, 0x2bc0)
-#    elif ppuSection == "att3":
-#        return compressKonamiRLE(data, 0x2fc0)
-#    elif ppuSection == "chr0":
-#        return compressKonamiRLE(data, 0x0000)
-#    elif ppuSection == "chr1":
-#        return compressKonamiRLE(data, 0x1000)
-#    elif ppuSection == "bgPal":
-#        return compressKonamiRLE(data, 0x3f00)
-#    elif ppuSection == "spritePal":
-#        return compressKonamiRLE(data, 0x3f10)
 
 proc print(log: var string, s: string) =
 #    echo s
@@ -388,6 +579,7 @@ proc usage() =
     echo "  -b, --bkpal:filename            output filename for background palette (d)"
     echo "  -s, --spritepal:filename        output filename for sprite palette (d)"
     echo "  -f, --fill:tile                 initial tile to fill nametables with (d)"
+    echo "  -k, --keys:keys                 specify a comma separated list of keys for .nss files"
     echo "  -h, --help                      Show this help"
     echo "  -v, --version                   show detailed version information"
     echo ""
@@ -395,7 +587,7 @@ proc usage() =
     echo "Items labeled with (c) apply only to compressing."
     echo ""
     echo "Valid compression methods are:"
-    echo "  [konami, konami2, kemko, stripe (d), packbits (d), ppudump (d)]"
+    echo "  [konami, konami2, kemko, stripe (d), packbits (d), ppudump (d), downtown]"
     echo ""
     echo "When specifying filenames, you may also use a colon at the end and add"
     echo "a file offset."
@@ -452,7 +644,7 @@ when isMainModule:
         echo "Build: ", app.date, " ", app.time, " Nim ", app.nimVersion
         quit()
     
-    if options.haskey("decompress", "d") or options.haskey("compress", "c"):
+    if options.haskey("decompress", "d") or options.haskey("compress", "c") or options.haskey("test", "t"):
         echo app.name, " ", app.version
     else:
         # did not specify compress or decompress
@@ -462,12 +654,55 @@ when isMainModule:
     if options.hasKey("m", "method"):
         mode = options.getVal("m", "method")
     
+    if options.haskey("test", "t"):
+        let fileData = readFile("downtown.nss")
+        let keys = options.getVal("keys", "k").split(",")
+        let data = parseNss2(fileData, keys.mapIt(it.split(":")[0]))
+        
+        var newData: seq[byte]
+        
+        for key in keys:
+            let key = parseFilename(key)
+            if key.offset == 0 and key.length == 0:
+                newData.add(data[key.name.toLowerAscii].decodeNssData)
+            else:
+                newData.add(data[key.name.toLowerAscii].decodeNssData[key.offset..<key.offset + key.length])
+        
+        echo newData
+        
+        
+        
+#let filtered = items.filterIt(it.split(",")[0] == "apple")
+#        let filtered = keys.filterIt(it.split(":")[0] == "apple")
+#            for key in keys:
+#                keys2
+            
+#let data = parseNss2(fileData, @["palette", "nametable"])
+
+
+#        var t = initTable[string, string]()
+#        let data = parseNss2(fileData, @["palette", "nametable"])
+#        echo data
+        
+#        var data2 = data["nametable"].decodeNssData[100..150]
+#        data2.add(data["palette"].decodeNssData)
+#        echo data2
+        
+    
     if options.haskey("decompress", "d"):
         let inputFile = parseFilename(options.getVal("decompress", "d"))
         
         echo "decompressing from file: ", inputFile.name, "...\n"
-        let data = readFileData(inputFile.name)
-        
+        let data = 
+            if inputFile.name.splitFile.ext == ".nss":
+                if options.haskey("keys", "k"):
+                    let keys = options.getVal("keys", "k").split(",")
+                    loadNss(inputFile.name, keys)
+                else:
+                    loadNss(inputFile.name)
+            else:
+                readFileData(inputFile.name)
+            
         var ppu = newSeq[byte](0x4000)
         
         var fillTile:byte = 0x00
@@ -488,7 +723,28 @@ when isMainModule:
         let inputFile = parseFilename(options.getVal("compress", "c"))
         
         echo "compressing from file: ", inputFile.name, "..."
-        var data = readFileData(inputFile.name)
+        
+        var data = 
+            if inputFile.name.splitFile.ext == ".nss":
+                let keys = 
+                    if options.haskey("keys", "k"):
+                        options.getVal("keys", "k").split(",")
+                    else:
+                        @["nametable", "attrtable"]
+                
+                let data = parseNss2(readFile(inputFile.name), keys.mapIt(it.split(":")[0]))
+                var newData: seq[byte]
+                
+                for key in keys:
+                    let key = parseFilename(key)
+                    if key.offset == 0 and key.length == 0:
+                        newData.add(data[key.name.toLowerAscii].decodeNssData)
+                    else:
+                        newData.add(data[key.name.toLowerAscii].decodeNssData[key.offset..<key.offset + key.length])
+                
+                newData
+            else:
+                readFileData(inputFile.name)
         
         # remove everything before the inputOffset
         data = data[inputFile.offset..len(data)-inputFile.offset-1]
@@ -497,14 +753,15 @@ when isMainModule:
         if options.haskey("ppuaddress", "a"):
             ppuAddress = options.getVal("ppuaddress", "a").toInt
         
-        var compressed = newSeq[byte]()
-#        var compressed = seq[byte]
-        if mode == "kemko":
-            compressed = compressKemkoRLE(data, ppuAddress)
-        elif mode == "konami":
-            compressed = compressKonamiRLE(data, ppuAddress)
-        else:
-            echo "unknown compress method"
+#        var compressed = newSeq[byte]()
+#        if mode == "kemko":
+#            compressed = compressKemkoRLE(data, ppuAddress)
+#        elif mode == "konami":
+#            compressed = compressKonamiRLE(data, ppuAddress)
+#        else:
+#            echo "unknown compress method"
+        
+        let compressed = compress(formats.getMethod(mode), data, ppuAddress)
         
         echo fmt"  Compressed size: {compressed.len} bytes"
         echo fmt"  Target PPU Address: 0x{ppuAddress:04x}"
